@@ -19,6 +19,7 @@ package metrics
 import (
 	"context"
 	"net/url"
+	"sync"
 	"testing"
 	"time"
 
@@ -117,6 +118,79 @@ func histogramBounds(mf *dto.MetricFamily) []float64 {
 	return bounds
 }
 
+func TestLatencyAdapterObserveNoopsWhenUnset(t *testing.T) {
+	t.Parallel()
+
+	var a latencyAdapter
+	a.Observe(context.Background(), "GET", url.URL{Host: "example.com"}, time.Millisecond)
+}
+
+func TestLatencyAdapterObservesAfterStore(t *testing.T) {
+	t.Parallel()
+
+	custom := []float64{0.001, 0.0025, 0.005, 0.025, 0.1}
+	h := restClientDurationHistogram(
+		"test_latency_adapter_observe",
+		"test",
+		[]string{verbLabel, hostLabel},
+		custom,
+	)
+
+	var a latencyAdapter
+	a.metric.Store(h)
+	a.Observe(context.Background(), "PATCH", url.URL{Host: "example.com"}, time.Millisecond)
+
+	reg := prometheus.NewPedanticRegistry()
+	if err := reg.Register(h); err != nil {
+		t.Fatal(err)
+	}
+	mfs, err := reg.Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(mfs) != 1 || len(mfs[0].GetMetric()) != 1 {
+		t.Fatalf("expected one metric family with one series, got %#v", mfs)
+	}
+	buckets := mfs[0].GetMetric()[0].GetHistogram().GetBucket()
+	if len(buckets) != len(custom) {
+		t.Fatalf("got %d buckets, want %d", len(buckets), len(custom))
+	}
+	// 1ms observation should land in the 0.001s bucket, not collapse into 5ms.
+	if buckets[0].GetCumulativeCount() != 1 {
+		t.Fatalf("le=0.001 count=%d, want 1", buckets[0].GetCumulativeCount())
+	}
+}
+
+func TestLatencyAdapterConcurrentObserveAndStore(t *testing.T) {
+	t.Parallel()
+
+	var a latencyAdapter
+	h := restClientDurationHistogram(
+		"test_latency_adapter_race",
+		"test",
+		[]string{verbLabel, hostLabel},
+		[]float64{0.001, 0.005, 0.025},
+	)
+
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			for j := 0; j < 1000; j++ {
+				a.Observe(context.Background(), "GET", url.URL{Host: "example.com"}, time.Millisecond)
+			}
+		}()
+	}
+
+	close(start)
+	a.metric.Store(h)
+	a.Observe(context.Background(), "PATCH", url.URL{Host: "example.com"}, time.Millisecond)
+	wg.Wait()
+}
+
 func TestRESTClientDurationHistogramBuckets(t *testing.T) {
 	t.Parallel()
 
@@ -173,6 +247,18 @@ func TestRESTClientDurationHistogramBuckets(t *testing.T) {
 		// 1ms observation should land in the 0.001s bucket, not collapse into 5ms.
 		if buckets[0].GetCumulativeCount() != 1 {
 			t.Fatalf("le=0.001 count=%d, want 1", buckets[0].GetCumulativeCount())
+		}
+	})
+
+	t.Run("request latency constructor uses the same name and default buckets", func(t *testing.T) {
+		t.Parallel()
+		h := newRequestLatency(nil)
+		if got := h.WithLabelValues("GET", "example.com"); got == nil {
+			t.Fatal("expected a labeled histogram")
+		}
+		bounds := gatherHistogramBounds(t, h, "GET", "example.com", 0.001)
+		if len(bounds) != len(defaultRESTClientDurationBuckets) {
+			t.Fatalf("got %d buckets, want %d: %v", len(bounds), len(defaultRESTClientDurationBuckets), bounds)
 		}
 	})
 }
