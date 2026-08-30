@@ -122,7 +122,7 @@ func TestLatencyAdapterObserveNoopsWhenUnset(t *testing.T) {
 	t.Parallel()
 
 	var a latencyAdapter
-	a.Observe(context.Background(), "GET", url.URL{Host: "example.com"}, time.Millisecond)
+	a.Observe(t.Context(), "GET", url.URL{Host: "example.com"}, time.Millisecond)
 }
 
 func TestLatencyAdapterObservesAfterStore(t *testing.T) {
@@ -138,7 +138,7 @@ func TestLatencyAdapterObservesAfterStore(t *testing.T) {
 
 	var a latencyAdapter
 	a.metric.Store(h)
-	a.Observe(context.Background(), "PATCH", url.URL{Host: "example.com"}, time.Millisecond)
+	a.Observe(t.Context(), "PATCH", url.URL{Host: "example.com"}, time.Millisecond)
 
 	reg := prometheus.NewPedanticRegistry()
 	if err := reg.Register(h); err != nil {
@@ -172,22 +172,21 @@ func TestLatencyAdapterConcurrentObserveAndStore(t *testing.T) {
 		[]float64{0.001, 0.005, 0.025},
 	)
 
+	ctx := t.Context()
 	start := make(chan struct{})
 	var wg sync.WaitGroup
-	for i := 0; i < 8; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+	for range 8 {
+		wg.Go(func() {
 			<-start
-			for j := 0; j < 1000; j++ {
-				a.Observe(context.Background(), "GET", url.URL{Host: "example.com"}, time.Millisecond)
+			for range 1000 {
+				a.Observe(ctx, "GET", url.URL{Host: "example.com"}, time.Millisecond)
 			}
-		}()
+		})
 	}
 
 	close(start)
 	a.metric.Store(h)
-	a.Observe(context.Background(), "PATCH", url.URL{Host: "example.com"}, time.Millisecond)
+	a.Observe(ctx, "PATCH", url.URL{Host: "example.com"}, time.Millisecond)
 	wg.Wait()
 }
 
